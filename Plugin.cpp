@@ -2,6 +2,7 @@
 #include <array>
 #include <atomic>
 #include <memory>
+#include <functional>
 
 class RrSamplePadsProcessor final : public juce::AudioProcessor
 {
@@ -14,18 +15,20 @@ public:
         std::atomic<float> gain { 1.0f };
         std::atomic<float> velocity { 1.0f };
         std::atomic<int> note { 36 };
-        std::atomic<int> choke { 0 };
-        std::atomic<bool> normalise { false };
         juce::String name;
         std::atomic<double> sourceRate { 44100.0 };
     };
 
     RrSamplePadsProcessor()
-        : AudioProcessor(BusesProperties().withOutput("Output", juce::AudioChannelSet::stereo(), true)
-                                           .withInput("Input", juce::AudioChannelSet::stereo(), true))
+        : AudioProcessor(BusesProperties().withInput("Input", juce::AudioChannelSet::stereo(), true)
+                                           .withOutput("Output", juce::AudioChannelSet::stereo(), true))
     {
         formats.registerBasicFormats();
-        for (int i = 0; i < padCount; ++i) { pads[(size_t)i].name = "Pad " + juce::String(i + 1); pads[(size_t)i].note = 36 + i; }
+        for (int i = 0; i < padCount; ++i)
+        {
+            pads[(size_t)i].name = "PAD " + juce::String(i + 1);
+            pads[(size_t)i].note.store(36 + i);
+        }
     }
 
     const juce::String getName() const override { return "Rr Sample Pads"; }
@@ -45,27 +48,23 @@ public:
     void releaseResources() override { stopAll(); }
     bool isBusesLayoutSupported(const BusesLayout& layouts) const override
     {
-        return layouts.getMainOutputChannelSet() == juce::AudioChannelSet::mono()
-            || layouts.getMainOutputChannelSet() == juce::AudioChannelSet::stereo();
+        const auto out = layouts.getMainOutputChannelSet();
+        const auto in = layouts.getMainInputChannelSet();
+        return (out == juce::AudioChannelSet::mono() || out == juce::AudioChannelSet::stereo())
+            && (in == juce::AudioChannelSet::disabled() || in == out);
     }
 
     void processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midi) override
     {
         juce::ScopedNoDenormals noDenormals;
-        // Preserve the incoming track signal; sample pads are mixed into the insert output.
         for (const auto metadata : midi)
         {
             const auto msg = metadata.getMessage();
             if (msg.isNoteOn())
-            {
                 for (int i = 0; i < padCount; ++i)
                     if (msg.getNoteNumber() == pads[(size_t)i].note.load())
                         triggerPad(i, msg.getFloatVelocity());
-            }
-            else if (msg.isAllNotesOff() || msg.isAllSoundOff())
-            {
-                stopAll();
-            }
+            // MIDI note-off intentionally does not stop one-shot samples.
         }
 
         for (int i = 0; i < padCount; ++i)
@@ -75,23 +74,26 @@ public:
             if (!sample) continue;
             double pos = p.position.load();
             if (pos < 0.0) continue;
-            const double sourceRate = p.sourceRate.load();
-            const double step = sourceRate > 0.0 && currentRate > 0.0 ? sourceRate / currentRate : 1.0;
+
+            const double sr = p.sourceRate.load();
+            const double step = (sr > 0.0 && currentRate > 0.0) ? sr / currentRate : 1.0;
             const float gain = p.gain.load() * p.velocity.load() * master.load();
             const int sourceChannels = sample->getNumChannels();
             const int sourceLength = sample->getNumSamples();
-            for (int outSample = 0; outSample < buffer.getNumSamples(); ++outSample)
+            if (sourceChannels <= 0 || sourceLength <= 0) { p.position.store(-1.0); continue; }
+
+            for (int n = 0; n < buffer.getNumSamples(); ++n)
             {
-                const int index0 = (int)pos;
-                if (index0 >= sourceLength) { pos = -1.0; break; }
-                const int index1 = juce::jmin(index0 + 1, sourceLength - 1);
-                const float fraction = (float)(pos - index0);
+                const int i0 = (int)pos;
+                if (i0 >= sourceLength) { pos = -1.0; break; }
+                const int i1 = juce::jmin(i0 + 1, sourceLength - 1);
+                const float frac = (float)(pos - i0);
                 for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
                 {
                     const int srcCh = juce::jmin(ch, sourceChannels - 1);
-                    const float a = sample->getSample(srcCh, index0);
-                    const float b = sample->getSample(srcCh, index1);
-                    buffer.addSample(ch, outSample, (a + (b - a) * fraction) * gain);
+                    const float a = sample->getSample(srcCh, i0);
+                    const float b = sample->getSample(srcCh, i1);
+                    buffer.addSample(ch, n, (a + (b - a) * frac) * gain);
                 }
                 pos += step;
             }
@@ -102,8 +104,6 @@ public:
     void triggerPad(int index, float velocity = 1.0f)
     {
         if (index < 0 || index >= padCount) return;
-        // Polyphonic sampler: triggering one pad never stops another pad.
-        // Every pad owns an independent playback position.
         auto sample = std::atomic_load(&pads[(size_t)index].audio);
         if (sample)
         {
@@ -111,23 +111,23 @@ public:
             pads[(size_t)index].position.store(0.0);
         }
     }
-    void stopAll() { for (auto& p : pads) p.position.store(-1); }
+
+    void stopAll() { for (auto& p : pads) p.position.store(-1.0); }
+
     bool loadSample(int index, const juce::File& file)
     {
         if (index < 0 || index >= padCount || !file.existsAsFile()) return false;
         std::unique_ptr<juce::AudioFormatReader> reader(formats.createReaderFor(file));
-        if (!reader || reader->lengthInSamples <= 0 || reader->lengthInSamples > 100000000) return false;
+        if (!reader || reader->lengthInSamples <= 0 || reader->lengthInSamples > 100000000
+            || reader->numChannels == 0) return false;
+
         auto data = std::make_shared<juce::AudioBuffer<float>>((int)reader->numChannels, (int)reader->lengthInSamples);
-        reader->read(data.get(), 0, (int)reader->lengthInSamples, 0, true, true);
-        if (pads[(size_t)index].normalise.load())
-        {
-            const float peak = data->getMagnitude(0, data->getNumSamples());
-            if (peak > 0.00001f) data->applyGain(0.999f / peak);
-        }
+        if (!reader->read(data.get(), 0, (int)reader->lengthInSamples, 0, true, true)) return false;
+
         std::atomic_store(&pads[(size_t)index].audio, data);
         pads[(size_t)index].sourceRate.store(reader->sampleRate);
         pads[(size_t)index].name = file.getFileNameWithoutExtension();
-        pads[(size_t)index].position.store(-1);
+        pads[(size_t)index].position.store(-1.0);
         return true;
     }
 
@@ -141,25 +141,28 @@ public:
             juce::ValueTree node("Pad");
             node.setProperty("index", i, nullptr);
             node.setProperty("name", p.name, nullptr);
-            node.setProperty("note", p.note.load(), nullptr);
             node.setProperty("gain", p.gain.load(), nullptr);
-            node.setProperty("choke", p.choke.load(), nullptr);
-            node.setProperty("normalise", p.normalise.load(), nullptr);
-            auto data = std::atomic_load(&p.audio);
-            if (data)
+            auto audio = std::atomic_load(&p.audio);
+            if (audio)
             {
-                juce::MemoryBlock audioBytes;
+                juce::MemoryBlock bytes;
+                juce::MemoryOutputStream stream(bytes, false);
                 juce::WavAudioFormat wav;
-                juce::MemoryOutputStream stream(audioBytes, false);
-                const double savedRate = p.sourceRate.load() > 0.0 ? p.sourceRate.load() : 44100.0;
-                std::unique_ptr<juce::AudioFormatWriter> writer(wav.createWriterFor(&stream, savedRate, (unsigned int)data->getNumChannels(), 24, {}, 0));
-                if (writer) { writer->writeFromAudioSampleBuffer(*data, 0, data->getNumSamples()); writer.reset(); node.setProperty("audio", juce::var(audioBytes.toBase64Encoding()), nullptr); }
+                const double rate = p.sourceRate.load() > 0.0 ? p.sourceRate.load() : 44100.0;
+                std::unique_ptr<juce::AudioFormatWriter> writer(wav.createWriterFor(
+                    &stream, rate, (unsigned int)audio->getNumChannels(), 24, {}, 0));
+                if (writer)
+                {
+                    writer->writeFromAudioSampleBuffer(*audio, 0, audio->getNumSamples());
+                    writer.reset();
+                    node.setProperty("audio", bytes.toBase64Encoding(), nullptr);
+                }
             }
             root.addChild(node, -1, nullptr);
         }
-        std::unique_ptr<juce::XmlElement> xml(root.createXml());
-        copyXmlToBinary(*xml, dest);
+        if (auto xml = root.createXml()) copyXmlToBinary(*xml, dest);
     }
+
     void setStateInformation(const void* data, int size) override
     {
         auto xml = getXmlFromBinary(data, size);
@@ -173,23 +176,22 @@ public:
             const int index = (int)node.getProperty("index", -1);
             if (index < 0 || index >= padCount) continue;
             auto& p = pads[(size_t)index];
-            p.name = node.getProperty("name", "Pad " + juce::String(index + 1)).toString();
-            p.note.store((int)node.getProperty("note", 36 + index));
-            p.gain.store((float)node.getProperty("gain", 1.0));
-            p.choke.store((int)node.getProperty("choke", 0));
-            p.normalise.store((bool)node.getProperty("normalise", false));
+            p.name = node.getProperty("name", "PAD " + juce::String(index + 1)).toString();
+            p.gain.store(juce::jlimit(0.0f, 2.0f, (float)node.getProperty("gain", 1.0)));
             juce::MemoryBlock bytes;
             if (bytes.fromBase64Encoding(node.getProperty("audio").toString()))
             {
                 juce::MemoryInputStream stream(bytes, false);
                 juce::WavAudioFormat wav;
                 std::unique_ptr<juce::AudioFormatReader> reader(wav.createReaderFor(&stream, false));
-                if (reader && reader->lengthInSamples > 0)
+                if (reader && reader->lengthInSamples > 0 && reader->numChannels > 0)
                 {
                     auto audio = std::make_shared<juce::AudioBuffer<float>>((int)reader->numChannels, (int)reader->lengthInSamples);
-                    reader->read(audio.get(), 0, (int)reader->lengthInSamples, 0, true, true);
-                    std::atomic_store(&p.audio, audio);
-                    p.sourceRate.store(reader->sampleRate);
+                    if (reader->read(audio.get(), 0, (int)reader->lengthInSamples, 0, true, true))
+                    {
+                        std::atomic_store(&p.audio, audio);
+                        p.sourceRate.store(reader->sampleRate);
+                    }
                 }
             }
         }
@@ -201,11 +203,81 @@ public:
     juce::AudioFormatManager formats;
 };
 
-class PadButton final : public juce::TextButton
+class SamplePadView final : public juce::Component
 {
 public:
-    std::function<void()> onLoad;
-    void mouseDoubleClick(const juce::MouseEvent&) override { if (onLoad) onLoad(); }
+    SamplePadView(RrSamplePadsProcessor& p, int padIndex, std::function<void()> select)
+        : proc(p), index(padIndex), onSelect(std::move(select))
+    {
+        addAndMakeVisible(play);
+        play.setButtonText("▶");
+        play.onClick = [this] { onSelect(); proc.triggerPad(index); };
+        play.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff242936));
+        play.setColour(juce::TextButton::textColourOffId, juce::Colour(0xfff2a34a));
+
+        addAndMakeVisible(load);
+        load.setButtonText("LOAD");
+        load.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff343b4a));
+        load.setColour(juce::TextButton::textColourOffId, juce::Colour(0xffd8dbe2));
+        load.onClick = [this] { onSelect(); if (onLoad) onLoad(index); };
+
+        addAndMakeVisible(name);
+        name.setJustificationType(juce::Justification::centred);
+        name.setColour(juce::Label::textColourId, juce::Colour(0xffd9dce4));
+        name.setFont(juce::Font(12.0f, juce::Font::bold));
+
+        addAndMakeVisible(volume);
+        volume.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
+        volume.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 54, 16);
+        volume.setTextValueSuffix(" %");
+        volume.setRange(0.0, 200.0, 1.0);
+        volume.setValue(proc.pads[(size_t)index].gain.load() * 100.0, juce::dontSendNotification);
+        volume.setColour(juce::Slider::rotarySliderFillColourId, juce::Colour(0xffe99a3c));
+        volume.setColour(juce::Slider::rotarySliderOutlineColourId, juce::Colour(0xff555b69));
+        volume.setColour(juce::Slider::textBoxTextColourId, juce::Colour(0xffcbd0da));
+        volume.onValueChange = [this] { proc.pads[(size_t)index].gain.store((float)(volume.getValue() / 100.0)); };
+    }
+
+    void setSelected(bool s) { selected = s; repaint(); }
+    void refreshName()
+    {
+        auto audio = std::atomic_load(&proc.pads[(size_t)index].audio);
+        name.setText(audio ? proc.pads[(size_t)index].name : "Drop sample", juce::dontSendNotification);
+    }
+
+    void paint(juce::Graphics& g) override
+    {
+        auto r = getLocalBounds().toFloat().reduced(1.0f);
+        g.setColour(juce::Colour(0xff20232c));
+        g.fillRoundedRectangle(r, 9.0f);
+        g.setColour(selected ? juce::Colour(0xfff19a38) : juce::Colour(0xff414653));
+        g.drawRoundedRectangle(r, 9.0f, selected ? 2.2f : 1.0f);
+        g.setColour(juce::Colour(0xffaeb5c2));
+        g.setFont(juce::Font(11.0f, juce::Font::bold));
+        g.drawText("PAD " + juce::String(index + 1), 8, 5, getWidth() - 16, 17, juce::Justification::centredLeft);
+    }
+
+    void resized() override
+    {
+        auto area = getLocalBounds().reduced(8);
+        area.removeFromTop(23);
+        auto bottom = area.removeFromBottom(28);
+        load.setBounds(bottom.removeFromRight(58));
+        name.setBounds(area.removeFromTop(22));
+        play.setBounds(area.removeFromTop(34).withSizeKeepingCentre(42, 32));
+        volume.setBounds(area.reduced(3));
+    }
+
+    std::function<void(int)> onLoad;
+
+private:
+    RrSamplePadsProcessor& proc;
+    int index;
+    std::function<void()> onSelect;
+    bool selected = false;
+    juce::TextButton play, load;
+    juce::Label name;
+    juce::Slider volume;
 };
 
 class RrSamplePadsEditor final : public juce::AudioProcessorEditor, private juce::FileDragAndDropTarget
@@ -213,94 +285,135 @@ class RrSamplePadsEditor final : public juce::AudioProcessorEditor, private juce
 public:
     explicit RrSamplePadsEditor(RrSamplePadsProcessor& p) : AudioProcessorEditor(p), proc(p)
     {
-        setSize(740, 620);
+        setSize(900, 700);
         setResizable(true, true);
         for (int i = 0; i < 16; ++i)
         {
-            auto* b = pads.add(new PadButton());
-            addAndMakeVisible(b);
-            b->setButtonText(juce::String(i + 1) + "\nDrop sample");
-            b->setColour(juce::TextButton::buttonColourId, juce::Colour(0xff242329));
-            b->setColour(juce::TextButton::textColourOffId, juce::Colour(0xffaaa8b2));
-            b->onClick = [this, i] { proc.triggerPad(i); };
-            b->onLoad = [this, i] { chooseFile(i); };
-            b->setClickingTogglesState(false);
+            auto* pad = pads.add(new SamplePadView(proc, i, [this, i] { selectedPad = i; updateSelection(); }));
+            addAndMakeVisible(pad);
+            pad->onLoad = [this](int index) { chooseFile(index); };
+            pad->refreshName();
         }
+
+        addAndMakeVisible(title);
+        title.setText("RR SAMPLE PADS", juce::dontSendNotification);
+        title.setFont(juce::Font(20.0f, juce::Font::bold));
+        title.setColour(juce::Label::textColourId, juce::Colour(0xfff0a044));
+
+        addAndMakeVisible(subtitle);
+        subtitle.setText("16 SLOT SAMPLE PLAYER", juce::dontSendNotification);
+        subtitle.setFont(juce::Font(10.0f, juce::Font::bold));
+        subtitle.setColour(juce::Label::textColourId, juce::Colour(0xff858d9c));
+
         addAndMakeVisible(masterLabel);
-        masterLabel.setText("Master", juce::dontSendNotification);
+        masterLabel.setText("MASTER", juce::dontSendNotification);
+        masterLabel.setColour(juce::Label::textColourId, juce::Colour(0xffd5d9e2));
+        masterSlider.setSliderStyle(juce::Slider::LinearHorizontal);
+        masterSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 55, 20);
+        masterSlider.setRange(0.0, 200.0, 1.0);
+        masterSlider.setValue(proc.master.load() * 100.0, juce::dontSendNotification);
+        masterSlider.setTextValueSuffix(" %");
+        masterSlider.onValueChange = [this] { proc.master.store((float)(masterSlider.getValue() / 100.0)); };
         addAndMakeVisible(masterSlider);
-        masterSlider.setRange(0.0, 2.0, 0.01);
-        masterSlider.setValue(proc.master.load(), juce::dontSendNotification);
-        masterSlider.onValueChange = [this] { proc.master.store((float)masterSlider.getValue()); };
+
         addAndMakeVisible(stopButton);
-        stopButton.setButtonText("Stop All");
+        stopButton.setButtonText("STOP ALL");
+        stopButton.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff49313a));
+        stopButton.setColour(juce::TextButton::textColourOffId, juce::Colour(0xffffb5b5));
         stopButton.onClick = [this] { proc.stopAll(); };
-        addAndMakeVisible(hint);
-        hint.setText("Double-click a pad to load audio  |  Drag & drop audio files onto pads", juce::dontSendNotification);
-        hint.setJustificationType(juce::Justification::centred);
-        refreshLabels();
+
+        addAndMakeVisible(status);
+        status.setText("Double-click LOAD or drag an audio file onto a pad", juce::dontSendNotification);
+        status.setColour(juce::Label::textColourId, juce::Colour(0xff8992a1));
+        status.setJustificationType(juce::Justification::centredLeft);
+        updateSelection();
     }
+
     void paint(juce::Graphics& g) override
     {
-        g.fillAll(juce::Colour(0xff343238));
-        g.setColour(juce::Colour(0xffd2a15e));
-        g.setFont(juce::Font(18.0f, juce::Font::bold));
-        g.drawText("Sample Pads", 16, 7, getWidth() - 32, 26, juce::Justification::centredLeft);
+        g.fillAll(juce::Colour(0xff171a21));
+        g.setColour(juce::Colour(0xff252a34));
+        g.fillRoundedRectangle(getLocalBounds().toFloat().reduced(8.0f), 12.0f);
+        g.setColour(juce::Colour(0xff343b49));
+        g.drawRoundedRectangle(getLocalBounds().toFloat().reduced(8.0f), 12.0f, 1.0f);
+        g.setColour(juce::Colour(0xff343b49));
+        g.drawHorizontalLine(62, 18.0f, (float)getWidth() - 18.0f);
     }
+
     void resized() override
     {
-        auto area = getLocalBounds().reduced(10);
-        area.removeFromTop(32);
-        auto footer = area.removeFromBottom(48);
-        hint.setBounds(footer.removeFromTop(20));
-        masterLabel.setBounds(footer.removeFromLeft(55));
-        masterSlider.setBounds(footer.removeFromLeft(180).reduced(2));
-        stopButton.setBounds(footer.removeFromRight(100).reduced(2));
-        const int gap = 7;
-        const int w = (area.getWidth() - gap * 3) / 4;
-        const int h = (area.getHeight() - gap * 3) / 4;
+        auto bounds = getLocalBounds().reduced(18);
+        auto header = bounds.removeFromTop(48);
+        title.setBounds(header.removeFromTop(25));
+        subtitle.setBounds(header);
+        bounds.removeFromTop(12);
+
+        auto footer = bounds.removeFromBottom(58);
+        status.setBounds(footer.removeFromTop(20));
+        auto controls = footer.reduced(2);
+        masterLabel.setBounds(controls.removeFromLeft(75));
+        masterSlider.setBounds(controls.removeFromLeft(250));
+        stopButton.setBounds(controls.removeFromRight(105).reduced(2));
+
+        const int gap = 10;
+        const int cellW = (bounds.getWidth() - gap * 3) / 4;
+        const int cellH = (bounds.getHeight() - gap * 3) / 4;
         for (int i = 0; i < 16; ++i)
-            pads[i]->setBounds(area.getX() + (i % 4) * (w + gap), area.getY() + (i / 4) * (h + gap), w, h);
+            pads[i]->setBounds(bounds.getX() + (i % 4) * (cellW + gap),
+                               bounds.getY() + (i / 4) * (cellH + gap), cellW, cellH);
     }
+
     bool isInterestedInFileDrag(const juce::StringArray& files) override
     {
         return files.size() > 0;
     }
+
     void filesDropped(const juce::StringArray& files, int x, int y) override
     {
-        int index = -1;
         for (int i = 0; i < pads.size(); ++i)
-            if (pads[i]->getBounds().contains(x, y)) { index = i; break; }
-        if (index >= 0 && files.size() > 0)
-            proc.loadSample(index, juce::File(files[0]));
-        refreshLabels();
+        {
+            if (pads[i]->getBounds().contains(x, y) && files.size() > 0)
+            {
+                selectedPad = i;
+                proc.loadSample(i, juce::File(files[0]));
+                pads[i]->refreshName();
+                updateSelection();
+                return;
+            }
+        }
     }
+
 private:
     void chooseFile(int index)
     {
-        chooser = std::make_unique<juce::FileChooser>("Load sample", juce::File{}, "*.wav;*.mp3;*.aiff;*.aif;*.flac;*.ogg");
+        chooser = std::make_unique<juce::FileChooser>("Load sample into Pad " + juce::String(index + 1),
+            juce::File{}, "*.wav;*.mp3;*.aiff;*.aif;*.flac;*.ogg");
         chooser->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
             [this, index](const juce::FileChooser& fc)
             {
-                auto f = fc.getResult();
-                if (f.existsAsFile()) proc.loadSample(index, f);
-                refreshLabels();
+                const auto file = fc.getResult();
+                if (file.existsAsFile() && proc.loadSample(index, file))
+                {
+                    selectedPad = index;
+                    pads[index]->refreshName();
+                    status.setText("Loaded: " + file.getFileName(), juce::dontSendNotification);
+                    updateSelection();
+                }
             });
     }
-    void refreshLabels()
+
+    void updateSelection()
     {
-        for (int i = 0; i < 16; ++i)
-        {
-            auto data = std::atomic_load(&proc.pads[(size_t)i].audio);
-            pads[i]->setButtonText(juce::String(i + 1) + "\n" + (data ? proc.pads[(size_t)i].name : "Drop sample"));
-        }
+        for (int i = 0; i < pads.size(); ++i) pads[i]->setSelected(i == selectedPad);
     }
+
     RrSamplePadsProcessor& proc;
-    juce::OwnedArray<PadButton> pads;
-    juce::Label masterLabel, hint;
+    juce::OwnedArray<SamplePadView> pads;
+    juce::Label title, subtitle, masterLabel, status;
     juce::Slider masterSlider;
     juce::TextButton stopButton;
     std::unique_ptr<juce::FileChooser> chooser;
+    int selectedPad = 0;
 };
 
 juce::AudioProcessorEditor* RrSamplePadsProcessor::createEditor() { return new RrSamplePadsEditor(*this); }
