@@ -197,6 +197,7 @@ public:
         for (int i = 0; i < 16; ++i)
         {
             auto* b = pads.add(new PadButton());
+            addAndMakeVisible(b);
             b->setButtonText(juce::String(i + 1) + "\nDrop sample");
             b->setColour(juce::TextButton::buttonColourId, juce::Colour(0xff242329));
             b->setColour(juce::TextButton::textColourOffId, juce::Colour(0xffaaa8b2));
