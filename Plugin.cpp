@@ -52,7 +52,7 @@ public:
     void processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midi) override
     {
         juce::ScopedNoDenormals noDenormals;
-        buffer.clear();
+        // Preserve the incoming track signal; sample pads are mixed into the insert output.
         for (const auto metadata : midi)
         {
             const auto msg = metadata.getMessage();
