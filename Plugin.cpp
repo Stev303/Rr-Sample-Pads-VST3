@@ -232,7 +232,7 @@ public:
         masterLabel.setText("Master", juce::dontSendNotification);
         addAndMakeVisible(masterSlider);
         masterSlider.setRange(0.0, 2.0, 0.01);
-        masterSlider.setValue(1.0);
+        masterSlider.setValue(proc.master.load(), juce::dontSendNotification);
         masterSlider.onValueChange = [this] { proc.master.store((float)masterSlider.getValue()); };
         addAndMakeVisible(stopButton);
         stopButton.setButtonText("Stop All");
@@ -240,6 +240,7 @@ public:
         addAndMakeVisible(hint);
         hint.setText("Double-click a pad to load audio  |  Drag & drop audio files onto pads", juce::dontSendNotification);
         hint.setJustificationType(juce::Justification::centred);
+        refreshLabels();
     }
     void paint(juce::Graphics& g) override
     {
