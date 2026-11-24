@@ -91,7 +91,7 @@ public:
                     const int srcCh = juce::jmin(ch, sourceChannels - 1);
                     const float a = sample->getSample(srcCh, index0);
                     const float b = sample->getSample(srcCh, index1);
-                    buffer.addSample(ch, outSample, a + (b - a) * fraction, gain);
+                    buffer.addSample(ch, outSample, (a + (b - a) * fraction) * gain);
                 }
                 pos += step;
             }
