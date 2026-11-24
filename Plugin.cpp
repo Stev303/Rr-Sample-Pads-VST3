@@ -10,13 +10,14 @@ public:
     struct Pad
     {
         std::shared_ptr<juce::AudioBuffer<float>> audio;
-        std::atomic<int> position { -1 };
+        std::atomic<double> position { -1.0 };
         std::atomic<float> gain { 1.0f };
+        std::atomic<float> velocity { 1.0f };
         std::atomic<int> note { 36 };
         std::atomic<int> choke { 0 };
         std::atomic<bool> normalise { false };
         juce::String name;
-        double sourceRate = 44100.0;
+        std::atomic<double> sourceRate { 44100.0 };
     };
 
     RrSamplePadsProcessor()
@@ -56,10 +57,15 @@ public:
         {
             const auto msg = metadata.getMessage();
             if (msg.isNoteOn())
+            {
                 for (int i = 0; i < padCount; ++i)
                     if (msg.getNoteNumber() == pads[(size_t)i].note.load())
                         triggerPad(i, msg.getFloatVelocity());
-            else if (msg.isAllNotesOff() || msg.isAllSoundOff()) stopAll();
+            }
+            else if (msg.isAllNotesOff() || msg.isAllSoundOff())
+            {
+                stopAll();
+            }
         }
 
         for (int i = 0; i < padCount; ++i)
@@ -67,18 +73,29 @@ public:
             auto& p = pads[(size_t)i];
             auto sample = std::atomic_load(&p.audio);
             if (!sample) continue;
-            int pos = p.position.load();
-            if (pos < 0) continue;
-            const float gain = p.gain.load() * master.load();
-            const int n = juce::jmin(buffer.getNumSamples(), sample->getNumSamples() - pos);
-            if (n <= 0) { p.position.store(-1); continue; }
-            for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
+            double pos = p.position.load();
+            if (pos < 0.0) continue;
+            const double sourceRate = p.sourceRate.load();
+            const double step = sourceRate > 0.0 && currentRate > 0.0 ? sourceRate / currentRate : 1.0;
+            const float gain = p.gain.load() * p.velocity.load() * master.load();
+            const int sourceChannels = sample->getNumChannels();
+            const int sourceLength = sample->getNumSamples();
+            for (int outSample = 0; outSample < buffer.getNumSamples(); ++outSample)
             {
-                const int srcCh = juce::jmin(ch, sample->getNumChannels() - 1);
-                buffer.addFrom(ch, 0, *sample, srcCh, pos, n, gain);
+                const int index0 = (int)pos;
+                if (index0 >= sourceLength) { pos = -1.0; break; }
+                const int index1 = juce::jmin(index0 + 1, sourceLength - 1);
+                const float fraction = (float)(pos - index0);
+                for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
+                {
+                    const int srcCh = juce::jmin(ch, sourceChannels - 1);
+                    const float a = sample->getSample(srcCh, index0);
+                    const float b = sample->getSample(srcCh, index1);
+                    buffer.addSample(ch, outSample, a + (b - a) * fraction, gain);
+                }
+                pos += step;
             }
-            const int next = pos + n;
-            p.position.store(next >= sample->getNumSamples() ? -1 : next);
+            p.position.store(pos >= sourceLength ? -1.0 : pos);
         }
     }
 
@@ -90,7 +107,11 @@ public:
             for (int i = 0; i < padCount; ++i)
                 if (i != index && pads[(size_t)i].choke.load() == group) pads[(size_t)i].position.store(-1);
         auto sample = std::atomic_load(&pads[(size_t)index].audio);
-        if (sample) { pads[(size_t)index].gain.store(velocity); pads[(size_t)index].position.store(0); }
+        if (sample)
+        {
+            pads[(size_t)index].velocity.store(juce::jlimit(0.0f, 1.0f, velocity));
+            pads[(size_t)index].position.store(0.0);
+        }
     }
     void stopAll() { for (auto& p : pads) p.position.store(-1); }
     bool loadSample(int index, const juce::File& file)
@@ -106,7 +127,7 @@ public:
             if (peak > 0.00001f) data->applyGain(0.999f / peak);
         }
         std::atomic_store(&pads[(size_t)index].audio, data);
-        pads[(size_t)index].sourceRate = reader->sampleRate;
+        pads[(size_t)index].sourceRate.store(reader->sampleRate);
         pads[(size_t)index].name = file.getFileNameWithoutExtension();
         pads[(size_t)index].position.store(-1);
         return true;
@@ -132,7 +153,8 @@ public:
                 juce::MemoryBlock audioBytes;
                 juce::WavAudioFormat wav;
                 juce::MemoryOutputStream stream(audioBytes, false);
-                std::unique_ptr<juce::AudioFormatWriter> writer(wav.createWriterFor(&stream, currentRate > 0 ? currentRate : 44100.0, (unsigned int)data->getNumChannels(), 24, {}, 0));
+                const double savedRate = p.sourceRate.load() > 0.0 ? p.sourceRate.load() : 44100.0;
+                std::unique_ptr<juce::AudioFormatWriter> writer(wav.createWriterFor(&stream, savedRate, (unsigned int)data->getNumChannels(), 24, {}, 0));
                 if (writer) { writer->writeFromAudioSampleBuffer(*data, 0, data->getNumSamples()); writer.reset(); node.setProperty("audio", juce::var(audioBytes.toBase64Encoding()), nullptr); }
             }
             root.addChild(node, -1, nullptr);
@@ -169,6 +191,7 @@ public:
                     auto audio = std::make_shared<juce::AudioBuffer<float>>((int)reader->numChannels, (int)reader->lengthInSamples);
                     reader->read(audio.get(), 0, (int)reader->lengthInSamples, 0, true, true);
                     std::atomic_store(&p.audio, audio);
+                    p.sourceRate.store(reader->sampleRate);
                 }
             }
         }
@@ -246,10 +269,11 @@ public:
     }
     void filesDropped(const juce::StringArray& files, int x, int y) override
     {
-        const int col = juce::jlimit(0, 3, (x - 10) / juce::jmax(1, (getWidth() - 26) / 4));
-        const int row = juce::jlimit(0, 3, (y - 42) / juce::jmax(1, (getHeight() - 110) / 4));
-        const int index = row * 4 + col;
-        if (files.size() > 0) proc.loadSample(index, juce::File(files[0]));
+        int index = -1;
+        for (int i = 0; i < pads.size(); ++i)
+            if (pads[i]->getBounds().contains(x, y)) { index = i; break; }
+        if (index >= 0 && files.size() > 0)
+            proc.loadSample(index, juce::File(files[0]));
         refreshLabels();
     }
 private:
