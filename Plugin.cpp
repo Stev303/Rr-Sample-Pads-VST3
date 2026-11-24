@@ -102,10 +102,8 @@ public:
     void triggerPad(int index, float velocity = 1.0f)
     {
         if (index < 0 || index >= padCount) return;
-        const int group = pads[(size_t)index].choke.load();
-        if (group > 0)
-            for (int i = 0; i < padCount; ++i)
-                if (i != index && pads[(size_t)i].choke.load() == group) pads[(size_t)i].position.store(-1);
+        // Polyphonic sampler: triggering one pad never stops another pad.
+        // Every pad owns an independent playback position.
         auto sample = std::atomic_load(&pads[(size_t)index].audio);
         if (sample)
         {
